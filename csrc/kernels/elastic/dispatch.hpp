@@ -327,6 +327,7 @@ public:
         int* recv_src_metadata;
         int* channel_linked_list;
         int num_recv_tokens;
+        int expanded_row_offset;
         int recv_sf_token_stride, recv_sf_hidden_stride;
         int scaleout_rank_idx, scaleup_rank_idx;
 
@@ -360,6 +361,7 @@ static void __instantiate_kernel() {{
                                                  args.recv_src_metadata,
                                                  args.channel_linked_list,
                                                  args.num_recv_tokens,
+                                                 args.expanded_row_offset,
                                                  args.recv_sf_token_stride, args.recv_sf_hidden_stride,
                                                  args.scaleout_rank_idx, args.scaleup_rank_idx));
     }
@@ -373,6 +375,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
                                           int* recv_src_metadata,
                                           int* channel_linked_list,
                                           const int& num_recv_tokens, const int& num_max_tokens_per_rank,
+                                          const int& expanded_row_offset,
                                           const int& num_hidden_bytes,
                                           const int& num_sf_packs, const int& recv_sf_token_stride, const int& recv_sf_hidden_stride,
                                           const int& num_experts, const int& num_topk,
@@ -403,6 +406,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
         .recv_src_metadata = recv_src_metadata,
         .channel_linked_list = channel_linked_list,
         .num_recv_tokens = num_recv_tokens,
+        .expanded_row_offset = expanded_row_offset,
         .recv_sf_token_stride = recv_sf_token_stride, .recv_sf_hidden_stride = recv_sf_hidden_stride,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 1, false, true)};

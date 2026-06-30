@@ -667,27 +667,31 @@ public:
                torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                std::optional<torch::Tensor>, std::optional<torch::Tensor>,
                std::optional<EventHandle>>
-    dispatch(const torch::Tensor& x,
-             const std::optional<torch::Tensor>& sf,
-             const torch::Tensor& topk_idx,
-             const std::optional<torch::Tensor>& topk_weights,
-             const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
-             const std::optional<int>& cached_num_recv_tokens,
-             const std::optional<std::vector<int>>& cached_num_recv_tokens_per_expert_list,
-             const std::optional<torch::Tensor>& cached_psum_num_recv_tokens_per_scaleup_rank,
-             const std::optional<torch::Tensor>& cached_psum_num_recv_tokens_per_expert,
-             const std::optional<torch::Tensor>& cached_dst_buffer_slot_idx,
-             const std::optional<torch::Tensor>& cached_token_metadata_at_forward,
-             const std::optional<torch::Tensor>& cached_channel_linked_list,
-             const int& num_max_tokens_per_rank,
-             const int& num_experts, const int& expert_alignment,
-             const int& num_sms, const int& num_qps,
-             const std::optional<EventHandle>& previous_event,
-             const std::optional<EventHandle>& previous_event_before_epilogue,
-             const bool& async_with_compute_stream,
-             const bool& allocate_on_comm_stream,
-             const bool& do_handle_copy, const bool& do_cpu_sync, const bool& do_expand,
-             const bool& use_tma_aligned_col_major_sf) const {
+    dispatch_impl(const torch::Tensor& x,
+                  const std::optional<torch::Tensor>& sf,
+                  const torch::Tensor& topk_idx,
+                  const std::optional<torch::Tensor>& topk_weights,
+                  const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+                  const std::optional<int>& cached_num_recv_tokens,
+                  const std::optional<std::vector<int>>& cached_num_recv_tokens_per_expert_list,
+                  const std::optional<torch::Tensor>& cached_psum_num_recv_tokens_per_scaleup_rank,
+                  const std::optional<torch::Tensor>& cached_psum_num_recv_tokens_per_expert,
+                  const std::optional<torch::Tensor>& cached_recv_src_metadata,
+                  const std::optional<torch::Tensor>& cached_dst_buffer_slot_idx,
+                  const std::optional<torch::Tensor>& cached_token_metadata_at_forward,
+                  const std::optional<torch::Tensor>& cached_channel_linked_list,
+                  const int& num_max_tokens_per_rank,
+                  const int& num_experts, const int& expert_alignment,
+                  const int& num_sms, const int& num_qps,
+                  const std::optional<EventHandle>& previous_event,
+                  const std::optional<EventHandle>& previous_event_before_epilogue,
+                  const bool& async_with_compute_stream,
+                  const bool& allocate_on_comm_stream,
+                  const bool& do_handle_copy, const bool& do_cpu_sync, const bool& do_expand,
+                  const bool& use_tma_aligned_col_major_sf,
+                  const std::optional<torch::Tensor>& preallocated_recv_x,
+                  const std::optional<torch::Tensor>& preallocated_recv_topk_weights,
+                  const int& expanded_row_offset) const {
         // Check SM count
         EP_HOST_ASSERT(num_sms > 0);
 
@@ -699,6 +703,8 @@ public:
             EP_HOST_ASSERT(cached_psum_num_recv_tokens_per_scaleup_rank.has_value());
             EP_HOST_ASSERT(cached_psum_num_recv_tokens_per_expert.has_value());
             EP_HOST_ASSERT(cached_dst_buffer_slot_idx.has_value());
+            if (do_expand)
+                EP_HOST_ASSERT(cached_recv_src_metadata.has_value());
 
             // Hybrid kernels require more
             if (nccl_context->num_scaleout_ranks > 1) {
@@ -744,6 +750,48 @@ public:
             EP_HOST_ASSERT(num_tokens == num_tokens__);
             EP_HOST_ASSERT(topk_weights->is_cuda() and topk_weights->is_contiguous());
             topk_weights_ptr = topk_weights->data_ptr<float>();
+        }
+        if (cached_mode and do_expand) {
+            const auto [num_recv_tokens_, num_topk_p2] = get_shape<2>(cached_recv_src_metadata.value());
+            EP_HOST_ASSERT(num_recv_tokens_ == cached_num_recv_tokens.value());
+            EP_HOST_ASSERT(num_topk_p2 == num_topk + 2);
+            EP_HOST_ASSERT(cached_recv_src_metadata->is_cuda() and cached_recv_src_metadata->is_contiguous());
+            EP_HOST_ASSERT(cached_recv_src_metadata->scalar_type() == torch::kInt);
+        }
+
+        // Optional wave path: copy expanded rows into caller-owned global output buffers.
+        const bool use_preallocated_expanded_outputs =
+            preallocated_recv_x.has_value() or
+            preallocated_recv_topk_weights.has_value() or
+            expanded_row_offset != 0;
+        if (use_preallocated_expanded_outputs) {
+            EP_HOST_ASSERT(do_expand and "Preallocated dispatch outputs are only supported with expand mode");
+            EP_HOST_ASSERT(not sf.has_value() and "Preallocated expanded dispatch currently supports BF16 inputs only");
+            if (cached_mode) {
+                EP_HOST_ASSERT(cached_recv_src_metadata.has_value() and
+                               "Cached preallocated expanded dispatch requires forward source metadata");
+                EP_HOST_ASSERT(expanded_row_offset == 0 and
+                               "Cached preallocated expanded dispatch replays absolute row ids from metadata");
+            } else {
+                EP_HOST_ASSERT(topk_weights.has_value() and "Preallocated expanded dispatch requires top-k weights");
+                EP_HOST_ASSERT(preallocated_recv_topk_weights.has_value());
+            }
+            EP_HOST_ASSERT(preallocated_recv_x.has_value());
+            EP_HOST_ASSERT(expanded_row_offset >= 0);
+
+            const auto& recv_x_out = preallocated_recv_x.value();
+            EP_HOST_ASSERT(recv_x_out.is_cuda() and recv_x_out.is_contiguous());
+            EP_HOST_ASSERT(recv_x_out.scalar_type() == x.scalar_type());
+            EP_HOST_ASSERT(recv_x_out.dim() == 2 and recv_x_out.size(1) == hidden);
+            if (preallocated_recv_topk_weights.has_value()) {
+                EP_HOST_ASSERT(topk_weights.has_value());
+                const auto& recv_topk_weights_out = preallocated_recv_topk_weights.value();
+                EP_HOST_ASSERT(recv_topk_weights_out.is_cuda() and recv_topk_weights_out.is_contiguous());
+                EP_HOST_ASSERT(recv_topk_weights_out.scalar_type() == topk_weights->scalar_type());
+                EP_HOST_ASSERT(recv_topk_weights_out.dim() == 1);
+                EP_HOST_ASSERT(recv_x_out.size(0) == recv_topk_weights_out.size(0));
+            }
+            EP_HOST_ASSERT(expanded_row_offset <= recv_x_out.size(0));
         }
 
         // Expert receiving counter
@@ -977,12 +1025,14 @@ public:
         // Assign these values according to modes
         if (cached_mode) {
             // Cached mode
-            // TODO: support to expand for MoE training backward with cached handles from non-expanding forward,
-            // which requires maintaining the same expanding order between forward and backward
-            EP_HOST_ASSERT(not do_expand and "Cannot do expand with cached mode");
             EP_HOST_ASSERT(not do_cpu_sync and "Cannot do CPU sync with cached mode");
             num_recv_tokens = cached_num_recv_tokens.value();
             num_recv_tokens_per_expert_list = cached_num_recv_tokens_per_expert_list.value();
+            if (do_expand) {
+                EP_HOST_ASSERT(use_preallocated_expanded_outputs and
+                               "Cached expanded dispatch is only supported with caller-owned output buffers");
+                num_expanded_tokens = preallocated_recv_x->size(0);
+            }
         } else if (do_cpu_sync) {
             // Non-cached mode with sync
             const auto start_cpu_time = std::chrono::high_resolution_clock::now();
@@ -1042,13 +1092,18 @@ public:
         // Allocate received tensors
         // `recv_src_metadata` includes source token indices and buffer slot indices
         const auto num_allocated_tokens = do_expand ? num_expanded_tokens : num_recv_tokens;
-        auto recv_x = torch::empty({num_allocated_tokens, hidden}, x.options());
+        if (use_preallocated_expanded_outputs and do_cpu_sync)
+            EP_HOST_ASSERT(expanded_row_offset + num_allocated_tokens <= preallocated_recv_x->size(0));
+        auto recv_x = use_preallocated_expanded_outputs ?
+            preallocated_recv_x.value() :
+            torch::empty({num_allocated_tokens, hidden}, x.options());
         auto recv_sf = std::optional<torch::Tensor>();
         auto recv_topk_idx = std::optional<torch::Tensor>();
         auto recv_topk_weights = std::optional<torch::Tensor>();
-        auto recv_src_metadata = torch::empty(
-            {num_recv_tokens, num_topk + 2},
-            torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+        auto recv_src_metadata = (cached_mode and do_expand) ?
+            cached_recv_src_metadata.value() :
+            torch::empty({num_recv_tokens, num_topk + 2},
+                         torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
 
         // Optional tensors
         void* recv_sf_ptr = nullptr;
@@ -1072,17 +1127,19 @@ public:
             recv_topk_idx_ptr = recv_topk_idx->data_ptr<topk_idx_t>();
         }
         if (topk_weights.has_value()) {
-            recv_topk_weights = do_expand ?
-                torch::empty({num_allocated_tokens}, topk_weights->options()) :
-                torch::empty({num_allocated_tokens, num_topk}, topk_weights->options());
+            recv_topk_weights = use_preallocated_expanded_outputs ?
+                preallocated_recv_topk_weights.value() :
+                (do_expand ?
+                    torch::empty({num_allocated_tokens}, topk_weights->options()) :
+                    torch::empty({num_allocated_tokens, num_topk}, topk_weights->options()));
             recv_topk_weights_ptr = recv_topk_weights->data_ptr<float>();
         }
 
         // Process prefix sum, in expanding mode, it is also atomic counters
         if (do_expand) {
             // Slice and exclusive part and do atomic additions into inclusive
-            EP_HOST_ASSERT(not cached_mode);
-            psum_num_recv_tokens_per_expert = psum_num_recv_tokens_per_expert.slice(0, 0, num_local_experts);
+            if (not cached_mode)
+                psum_num_recv_tokens_per_expert = psum_num_recv_tokens_per_expert.slice(0, 0, num_local_experts);
         } else if (not cached_mode) {
             // Slice the inclusive part (and will not be used in the epilogue)
             psum_num_recv_tokens_per_expert = psum_num_recv_tokens_per_expert.slice(0, 1, num_local_experts + 1);
@@ -1099,6 +1156,7 @@ public:
                                       recv_src_metadata.data_ptr<int>(),
                                       channel_linked_list_ptr,
                                       num_recv_tokens, num_max_tokens_per_rank,
+                                      expanded_row_offset,
                                       num_hidden_bytes,
                                       num_sf_packs, recv_sf_token_stride, recv_sf_hidden_stride,
                                       num_experts, num_topk,
@@ -1137,6 +1195,149 @@ public:
                 token_metadata_at_forward,
                 channel_linked_list,
                 event};
+    }
+
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>, std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>,
+               std::vector<int>,
+               torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+               std::optional<torch::Tensor>, std::optional<torch::Tensor>,
+               std::optional<EventHandle>>
+    dispatch(const torch::Tensor& x,
+             const std::optional<torch::Tensor>& sf,
+             const torch::Tensor& topk_idx,
+             const std::optional<torch::Tensor>& topk_weights,
+             const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+             const std::optional<int>& cached_num_recv_tokens,
+             const std::optional<std::vector<int>>& cached_num_recv_tokens_per_expert_list,
+             const std::optional<torch::Tensor>& cached_psum_num_recv_tokens_per_scaleup_rank,
+             const std::optional<torch::Tensor>& cached_psum_num_recv_tokens_per_expert,
+             const std::optional<torch::Tensor>& cached_dst_buffer_slot_idx,
+             const std::optional<torch::Tensor>& cached_token_metadata_at_forward,
+             const std::optional<torch::Tensor>& cached_channel_linked_list,
+             const int& num_max_tokens_per_rank,
+             const int& num_experts, const int& expert_alignment,
+             const int& num_sms, const int& num_qps,
+             const std::optional<EventHandle>& previous_event,
+             const std::optional<EventHandle>& previous_event_before_epilogue,
+             const bool& async_with_compute_stream,
+             const bool& allocate_on_comm_stream,
+             const bool& do_handle_copy, const bool& do_cpu_sync, const bool& do_expand,
+             const bool& use_tma_aligned_col_major_sf) const {
+        return dispatch_impl(x, sf, topk_idx, topk_weights,
+                             cumulative_local_expert_recv_stats,
+                             cached_num_recv_tokens,
+                             cached_num_recv_tokens_per_expert_list,
+                             cached_psum_num_recv_tokens_per_scaleup_rank,
+                             cached_psum_num_recv_tokens_per_expert,
+                             std::nullopt,
+                             cached_dst_buffer_slot_idx,
+                             cached_token_metadata_at_forward,
+                             cached_channel_linked_list,
+                             num_max_tokens_per_rank,
+                             num_experts, expert_alignment,
+                             num_sms, num_qps,
+                             previous_event,
+                             previous_event_before_epilogue,
+                             async_with_compute_stream, allocate_on_comm_stream,
+                             do_handle_copy, do_cpu_sync, do_expand,
+                             use_tma_aligned_col_major_sf,
+                             std::nullopt, std::nullopt, 0);
+    }
+
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>, std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>,
+               std::vector<int>,
+               torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+               std::optional<torch::Tensor>, std::optional<torch::Tensor>,
+               std::optional<EventHandle>>
+    dispatch_expanded_into(const torch::Tensor& x,
+                           const std::optional<torch::Tensor>& sf,
+                           const torch::Tensor& topk_idx,
+                           const torch::Tensor& topk_weights,
+                           const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+                           const torch::Tensor& recv_x_out,
+                           const torch::Tensor& recv_topk_weights_out,
+                           const int& expanded_row_offset,
+                           const int& num_max_tokens_per_rank,
+                           const int& num_experts, const int& expert_alignment,
+                           const int& num_sms, const int& num_qps,
+                           const std::optional<EventHandle>& previous_event,
+                           const std::optional<EventHandle>& previous_event_before_epilogue,
+                           const bool& async_with_compute_stream,
+                           const bool& allocate_on_comm_stream,
+                           const bool& do_handle_copy, const bool& do_cpu_sync,
+                           const bool& use_tma_aligned_col_major_sf) const {
+        return dispatch_impl(x, sf, topk_idx, std::optional<torch::Tensor>(topk_weights),
+                             cumulative_local_expert_recv_stats,
+                             std::nullopt, std::nullopt,
+                             std::nullopt, std::nullopt, std::nullopt,
+                             std::nullopt,
+                             std::nullopt, std::nullopt,
+                             num_max_tokens_per_rank,
+                             num_experts, expert_alignment,
+                             num_sms, num_qps,
+                             previous_event,
+                             previous_event_before_epilogue,
+                             async_with_compute_stream, allocate_on_comm_stream,
+                             do_handle_copy, do_cpu_sync, true,
+                             use_tma_aligned_col_major_sf,
+                             std::optional<torch::Tensor>(recv_x_out),
+                             std::optional<torch::Tensor>(recv_topk_weights_out),
+                             expanded_row_offset);
+    }
+
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>, std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>,
+               std::vector<int>,
+               torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+               std::optional<torch::Tensor>, std::optional<torch::Tensor>,
+               std::optional<EventHandle>>
+    dispatch_cached_expanded_into(const torch::Tensor& x,
+                                  const std::optional<torch::Tensor>& sf,
+                                  const torch::Tensor& topk_idx,
+                                  const int& cached_num_recv_tokens,
+                                  const std::vector<int>& cached_num_recv_tokens_per_expert_list,
+                                  const torch::Tensor& cached_psum_num_recv_tokens_per_scaleup_rank,
+                                  const torch::Tensor& cached_psum_num_recv_tokens_per_expert,
+                                  const torch::Tensor& cached_recv_src_metadata,
+                                  const torch::Tensor& cached_dst_buffer_slot_idx,
+                                  const std::optional<torch::Tensor>& cached_token_metadata_at_forward,
+                                  const std::optional<torch::Tensor>& cached_channel_linked_list,
+                                  const torch::Tensor& recv_x_out,
+                                  const int& num_max_tokens_per_rank,
+                                  const int& num_experts, const int& expert_alignment,
+                                  const int& num_sms, const int& num_qps,
+                                  const std::optional<EventHandle>& previous_event,
+                                  const std::optional<EventHandle>& previous_event_before_epilogue,
+                                  const bool& async_with_compute_stream,
+                                  const bool& allocate_on_comm_stream,
+                                  const bool& do_cpu_sync,
+                                  const bool& use_tma_aligned_col_major_sf) const {
+        return dispatch_impl(x, sf, topk_idx, std::nullopt,
+                             std::nullopt,
+                             std::optional<int>(cached_num_recv_tokens),
+                             std::optional<std::vector<int>>(cached_num_recv_tokens_per_expert_list),
+                             std::optional<torch::Tensor>(cached_psum_num_recv_tokens_per_scaleup_rank),
+                             std::optional<torch::Tensor>(cached_psum_num_recv_tokens_per_expert),
+                             std::optional<torch::Tensor>(cached_recv_src_metadata),
+                             std::optional<torch::Tensor>(cached_dst_buffer_slot_idx),
+                             cached_token_metadata_at_forward,
+                             cached_channel_linked_list,
+                             num_max_tokens_per_rank,
+                             num_experts, expert_alignment,
+                             num_sms, num_qps,
+                             previous_event,
+                             previous_event_before_epilogue,
+                             async_with_compute_stream, allocate_on_comm_stream,
+                             false, do_cpu_sync, true,
+                             use_tma_aligned_col_major_sf,
+                             std::optional<torch::Tensor>(recv_x_out),
+                             std::nullopt,
+                             0);
     }
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>>
@@ -1323,6 +1524,8 @@ static void register_apis(pybind11::module_& m) {
         .def("agrs_get_inplace_tensor", &ElasticBuffer::agrs_get_inplace_tensor)
         .def("all_gather", &ElasticBuffer::all_gather)
         .def("dispatch", &ElasticBuffer::dispatch)
+        .def("dispatch_expanded_into", &ElasticBuffer::dispatch_expanded_into)
+        .def("dispatch_cached_expanded_into", &ElasticBuffer::dispatch_cached_expanded_into)
         .def("combine", &ElasticBuffer::combine);
     m.def("create_cpu_handle", &ElasticBuffer::create_cpu_handle);
     m.def("calculate_elastic_buffer_size", &ElasticBuffer::calculate_buffer_size);

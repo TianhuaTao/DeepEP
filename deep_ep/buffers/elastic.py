@@ -854,6 +854,152 @@ class ElasticBuffer:
         # Return
         return recv_x, recv_topk_idx, recv_topk_weights, handle, EventOverlap(event)
 
+    def dispatch_expanded_into(self,
+                               x: torch.Tensor,
+                               topk_idx: torch.Tensor,
+                               topk_weights: torch.Tensor,
+                               recv_x_out: torch.Tensor,
+                               recv_topk_weights_out: torch.Tensor,
+                               cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                               num_experts: Optional[int] = None,
+                               num_max_tokens_per_rank: Optional[int] = None,
+                               expert_alignment: Optional[int] = None,
+                               num_sms: int = 0, num_qps: int = 0,
+                               previous_event: Optional[EventHandle] = None,
+                               previous_event_before_epilogue: Optional[EventHandle] = None,
+                               async_with_compute_stream: bool = False,
+                               allocate_on_comm_stream: bool = False,
+                               do_handle_copy: bool = True,
+                               do_cpu_sync: Optional[bool] = None,
+                               expanded_row_offset: int = 0) \
+            -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, EPHandle, EventOverlap]:
+        """
+        Dispatch tokens in expanded mode into caller-owned output buffers.
+
+        This is an opt-in wave-overlap variant of `dispatch(..., do_expand=True)`: the copy epilogue writes
+        received token rows and expanded top-k weights at `expanded_row_offset + local_expanded_row`, while
+        the returned handle keeps the usual metadata needed by `combine`.
+
+        The initial implementation supports BF16 tensor inputs and uncached dispatch.
+        """
+        check_torch_deterministic()
+        assert not isinstance(x, tuple), 'dispatch_expanded_into currently supports BF16 tensor inputs only'
+        assert topk_idx is not None
+        assert topk_weights is not None
+        assert recv_x_out is not None
+        assert recv_topk_weights_out is not None
+        assert num_experts is not None
+
+        num_topk = topk_idx.shape[1]
+        num_sms = self.get_theoretical_num_sms(num_experts, num_topk) if num_sms == 0 else num_sms
+        num_qps = self.get_theoretical_num_qps(num_sms) if num_qps == 0 else num_qps
+        assert num_qps <= self.num_allocated_qps, f'Allocated QPs are not enough'
+
+        num_max_tokens_per_rank = value_or(num_max_tokens_per_rank, self.num_max_tokens_per_rank)
+        expert_alignment = value_or(expert_alignment, 1)
+        do_cpu_sync = value_or(do_cpu_sync, False)
+
+        (recv_x, recv_sf,
+         recv_topk_idx, recv_topk_weights,
+         cloned_topk_idx,
+         num_recv_tokens_per_expert_list,
+         psum_num_recv_tokens_per_scaleup_rank,
+         psum_num_recv_tokens_per_expert,
+         recv_src_metadata,
+         dst_buffer_slot_idx,
+         token_metadata_at_forward,
+         channel_linked_list,
+         event) = self.runtime.dispatch_expanded_into(x, None, topk_idx, topk_weights,
+                                                      cumulative_local_expert_recv_stats,
+                                                      recv_x_out, recv_topk_weights_out,
+                                                      int(expanded_row_offset),
+                                                      num_max_tokens_per_rank,
+                                                      num_experts, expert_alignment,
+                                                      num_sms, num_qps,
+                                                      previous_event,
+                                                      previous_event_before_epilogue,
+                                                      async_with_compute_stream, allocate_on_comm_stream,
+                                                      do_handle_copy, do_cpu_sync,
+                                                      False)
+        assert recv_sf is None
+        handle = EPHandle(True,
+                          num_experts, expert_alignment,
+                          num_max_tokens_per_rank,
+                          num_sms,
+                          cloned_topk_idx if do_handle_copy else topk_idx,
+                          num_recv_tokens_per_expert_list,
+                          psum_num_recv_tokens_per_scaleup_rank,
+                          psum_num_recv_tokens_per_expert,
+                          recv_src_metadata,
+                          dst_buffer_slot_idx,
+                          token_metadata_at_forward,
+                          channel_linked_list)
+
+        return recv_x, recv_topk_idx, recv_topk_weights, handle, EventOverlap(event)
+
+    def dispatch_cached_expanded_into(self,
+                                      x: torch.Tensor,
+                                      handle: EPHandle,
+                                      recv_x_out: torch.Tensor,
+                                      num_sms: int = 0, num_qps: int = 0,
+                                      previous_event: Optional[EventHandle] = None,
+                                      previous_event_before_epilogue: Optional[EventHandle] = None,
+                                      async_with_compute_stream: bool = False,
+                                      allocate_on_comm_stream: bool = False) \
+            -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], EPHandle, EventOverlap]:
+        """
+        Replay an expanded dispatch from a cached handle into a caller-owned output buffer.
+
+        This is the backward counterpart to `dispatch_expanded_into`: the forward handle's
+        `recv_src_metadata` stores the absolute expanded row id for each route, so cached
+        mode can place gradients into the same static expanded rows without recomputing
+        per-expert atomic placement.
+        """
+        check_torch_deterministic()
+        assert not isinstance(x, tuple), 'dispatch_cached_expanded_into currently supports BF16 tensor inputs only'
+        assert handle is not None
+        assert handle.do_expand, 'dispatch_cached_expanded_into requires an expanded forward handle'
+        assert recv_x_out is not None
+
+        num_topk = handle.topk_idx.shape[1]
+        num_sms = self.get_theoretical_num_sms(handle.num_experts, num_topk) if num_sms == 0 else num_sms
+        num_qps = self.get_theoretical_num_qps(num_sms) if num_qps == 0 else num_qps
+        assert num_qps <= self.num_allocated_qps, f'Allocated QPs are not enough'
+
+        (recv_x, recv_sf,
+         recv_topk_idx, recv_topk_weights,
+         _cloned_topk_idx,
+         _num_recv_tokens_per_expert_list,
+         _psum_num_recv_tokens_per_scaleup_rank,
+         _psum_num_recv_tokens_per_expert,
+         _recv_src_metadata,
+         _dst_buffer_slot_idx,
+         _token_metadata_at_forward,
+         _channel_linked_list,
+         event) = self.runtime.dispatch_cached_expanded_into(
+            x, None, handle.topk_idx,
+            handle.num_recv_tokens,
+            handle.num_recv_tokens_per_expert_list,
+            handle.psum_num_recv_tokens_per_scaleup_rank,
+            handle.psum_num_recv_tokens_per_expert,
+            handle.recv_src_metadata,
+            handle.dst_buffer_slot_idx,
+            handle.token_metadata_at_forward,
+            handle.channel_linked_list,
+            recv_x_out,
+            handle.num_max_tokens_per_rank,
+            handle.num_experts,
+            handle.expert_alignment,
+            num_sms, num_qps,
+            previous_event,
+            previous_event_before_epilogue,
+            async_with_compute_stream,
+            allocate_on_comm_stream,
+            False,
+            False)
+        assert recv_sf is None
+        return recv_x, recv_topk_idx, recv_topk_weights, handle, EventOverlap(event)
+
     @staticmethod
     def _unpack_bias(bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]) \
             -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:

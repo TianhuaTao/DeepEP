@@ -28,6 +28,7 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
                             int* recv_src_metadata,
                             int* channel_linked_list,
                             int num_recv_tokens,
+                            const int expanded_row_offset,
                             const int recv_sf_token_stride, const int recv_sf_hidden_stride,
                             const int scaleout_rank_idx, const int scaleup_rank_idx) {
     // Utils
@@ -112,8 +113,11 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         int dst_tensor_idx = -1;
         if (not kDoExpand and ptx::elect_one_sync()) {
             dst_tensor_idx = i;
+        } else if (kDoExpand and kCachedMode and dst_expert_idx >= 0) {
+            constexpr int kMetadataStride = 2 + kNumTopk;
+            dst_tensor_idx = __ldg(recv_src_metadata + i * kMetadataStride + 2 + lane_idx);
         } else if (kDoExpand and dst_expert_idx >= 0) {
-            dst_tensor_idx = atomicAdd(psum_num_recv_tokens_per_expert + dst_expert_idx, 1);
+            dst_tensor_idx = expanded_row_offset + atomicAdd(psum_num_recv_tokens_per_expert + dst_expert_idx, 1);
         }
         __syncwarp();
 
