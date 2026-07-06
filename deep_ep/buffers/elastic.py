@@ -1070,5 +1070,58 @@ class ElasticBuffer:
                                  previous_event_before_epilogue,
                                  async_with_compute_stream,
                                  allocate_on_comm_stream,
-                                 handle.do_expand)
+                                 handle.do_expand,
+                                 None,
+                                 0)
         return combined_x, combined_topk_weights, EventOverlap(event)
+
+    def combine_into(self,
+                     x: torch.Tensor,
+                     handle: EPHandle,
+                     combined_x_out: torch.Tensor,
+                     combined_row_offset: int = 0,
+                     topk_weights: Optional[torch.Tensor] = None,
+                     bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
+                     num_sms: int = 0, num_qps: int = 0,
+                     previous_event: EventHandle = None,
+                     previous_event_before_epilogue: Optional[EventHandle] = None,
+                     async_with_compute_stream: bool = False,
+                     allocate_on_comm_stream: bool = False) \
+            -> Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
+        """
+        Combine tokens into a caller-owned output tensor.
+
+        This experimental wave-overlap variant writes the reduce epilogue into
+        `combined_x_out[combined_row_offset:combined_row_offset + tokens]`.
+        """
+        check_torch_deterministic()
+
+        num_sms = handle.num_sms if num_sms == 0 else num_sms
+        num_qps = self.get_theoretical_num_qps(num_sms) if num_qps == 0 else num_qps
+        assert num_qps <= self.num_allocated_qps, f'Allocated QPs are not enough'
+
+        bias_0, bias_1 = ElasticBuffer._unpack_bias(bias)
+        combined_x, combined_topk_weights, event = \
+            self.runtime.combine(x, topk_weights,
+                                 bias_0, bias_1,
+                                 handle.recv_src_metadata,
+                                 handle.topk_idx,
+                                 handle.psum_num_recv_tokens_per_scaleup_rank,
+                                 handle.token_metadata_at_forward,
+                                 handle.channel_linked_list,
+                                 handle.num_experts,
+                                 handle.num_max_tokens_per_rank,
+                                 num_sms, num_qps,
+                                 previous_event,
+                                 previous_event_before_epilogue,
+                                 async_with_compute_stream,
+                                 allocate_on_comm_stream,
+                                 handle.do_expand,
+                                 combined_x_out,
+                                 int(combined_row_offset))
+        combined_slice = combined_x.narrow(
+            0,
+            int(combined_row_offset),
+            handle.topk_idx.shape[0],
+        )
+        return combined_slice, combined_topk_weights, EventOverlap(event)

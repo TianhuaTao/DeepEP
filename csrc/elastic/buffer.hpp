@@ -1357,7 +1357,9 @@ public:
             const std::optional<EventHandle>& previous_event_before_epilogue,
             const bool& async_with_compute_stream,
             const bool& allocate_on_comm_stream,
-            const bool& use_expanded_layout) const {
+            const bool& use_expanded_layout,
+            const std::optional<torch::Tensor>& preallocated_combined_x,
+            const int& combined_row_offset) const {
         // Check SM count
         EP_HOST_ASSERT(num_sms > 0);
 
@@ -1406,6 +1408,18 @@ public:
                 EP_HOST_ASSERT(bias.size(0) == num_combined_tokens and bias.size(1) == hidden);
                 bias_ptrs[i] = bias.data_ptr();
             }
+        }
+
+        const bool use_preallocated_combined_x =
+            preallocated_combined_x.has_value() or combined_row_offset != 0;
+        if (use_preallocated_combined_x) {
+            EP_HOST_ASSERT(preallocated_combined_x.has_value());
+            EP_HOST_ASSERT(combined_row_offset >= 0);
+            const auto& combined_x_out = preallocated_combined_x.value();
+            EP_HOST_ASSERT(combined_x_out.is_cuda() and combined_x_out.is_contiguous());
+            EP_HOST_ASSERT(combined_x_out.scalar_type() == x.scalar_type());
+            EP_HOST_ASSERT(combined_x_out.dim() == 2 and combined_x_out.size(1) == hidden);
+            EP_HOST_ASSERT(combined_row_offset + num_combined_tokens <= combined_x_out.size(0));
         }
 
         // Stream control
@@ -1464,8 +1478,13 @@ public:
             use_expanded_layout, allow_multiple_reduction,
             comm_stream);
 
-        // Allocate output tensors
-        auto combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
+        // Allocate output tensors, or write into caller-owned output for wave overlap.
+        auto combined_x = use_preallocated_combined_x ?
+            preallocated_combined_x.value() :
+            torch::empty({num_combined_tokens, hidden}, x.options());
+        auto combined_x_ptr = static_cast<nv_bfloat16*>(combined_x.data_ptr());
+        if (use_preallocated_combined_x)
+            combined_x_ptr += static_cast<int64_t>(combined_row_offset) * hidden;
         auto combined_topk_weights = std::optional<torch::Tensor>();
         float* combined_topk_weights_ptr = nullptr;
         if (topk_weights.has_value()) {
@@ -1475,7 +1494,7 @@ public:
 
         // Combine pushed data
         stream_control_before_epilogue(previous_event_before_epilogue);
-        launch_combine_reduce_epilogue(combined_x.data_ptr(),
+        launch_combine_reduce_epilogue(combined_x_ptr,
                                        combined_topk_weights_ptr,
                                        combined_topk_idx.data_ptr<topk_idx_t>(),
                                        num_combined_tokens, num_max_tokens_per_rank,
