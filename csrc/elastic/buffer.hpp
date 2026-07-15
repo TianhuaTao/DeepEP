@@ -640,10 +640,21 @@ public:
         // Dispatch size
         const auto elem_size = use_fp8_dispatch ? sizeof(__nv_fp8_e4m3) : sizeof(nv_bfloat16);
         const auto num_sf_packs = use_fp8_dispatch ? math::ceil_div(hidden, 32) : 0; // An approximation for number of SF packs
-        const auto num_dispatch_bytes = get_dispatch_buffer_size(
+        auto num_dispatch_bytes = get_dispatch_buffer_size(
             num_max_tokens_per_rank, hidden, num_sf_packs, num_topk, elem_size,
             num_scaleout_ranks, num_scaleup_ranks,
             is_scaleup_nvlink);
+        if (use_fp8_dispatch) {
+            // Training commonly uses FP8 for the forward dispatch but replays
+            // the cached layout with BF16 gradients in backward. The same
+            // ElasticBuffer must accommodate both payloads; BF16 rows are
+            // larger even after accounting for FP8 scale-factor packs.
+            const auto num_bf16_dispatch_bytes = get_dispatch_buffer_size(
+                num_max_tokens_per_rank, hidden, 0, num_topk, sizeof(nv_bfloat16),
+                num_scaleout_ranks, num_scaleup_ranks,
+                is_scaleup_nvlink);
+            num_dispatch_bytes = std::max(num_dispatch_bytes, num_bf16_dispatch_bytes);
+        }
 
         // Combine layout
         const auto num_combine_bytes = get_combine_buffer_size(
@@ -690,6 +701,7 @@ public:
                   const bool& do_handle_copy, const bool& do_cpu_sync, const bool& do_expand,
                   const bool& use_tma_aligned_col_major_sf,
                   const std::optional<torch::Tensor>& preallocated_recv_x,
+                  const std::optional<torch::Tensor>& preallocated_recv_sf,
                   const std::optional<torch::Tensor>& preallocated_recv_topk_weights,
                   const int& expanded_row_offset) const {
         // Check SM count
@@ -759,14 +771,14 @@ public:
             EP_HOST_ASSERT(cached_recv_src_metadata->scalar_type() == torch::kInt);
         }
 
-        // Optional wave path: copy expanded rows into caller-owned global output buffers.
+        // Optional static-output path: copy expanded rows into caller-owned buffers.
         const bool use_preallocated_expanded_outputs =
             preallocated_recv_x.has_value() or
+            preallocated_recv_sf.has_value() or
             preallocated_recv_topk_weights.has_value() or
             expanded_row_offset != 0;
         if (use_preallocated_expanded_outputs) {
             EP_HOST_ASSERT(do_expand and "Preallocated dispatch outputs are only supported with expand mode");
-            EP_HOST_ASSERT(not sf.has_value() and "Preallocated expanded dispatch currently supports BF16 inputs only");
             if (cached_mode) {
                 EP_HOST_ASSERT(cached_recv_src_metadata.has_value() and
                                "Cached preallocated expanded dispatch requires forward source metadata");
@@ -783,6 +795,18 @@ public:
             EP_HOST_ASSERT(recv_x_out.is_cuda() and recv_x_out.is_contiguous());
             EP_HOST_ASSERT(recv_x_out.scalar_type() == x.scalar_type());
             EP_HOST_ASSERT(recv_x_out.dim() == 2 and recv_x_out.size(1) == hidden);
+            EP_HOST_ASSERT(sf.has_value() == preallocated_recv_sf.has_value() and
+                           "FP8 preallocated expanded dispatch requires a caller-owned scale-factor output");
+            if (preallocated_recv_sf.has_value()) {
+                const auto& recv_sf_out = preallocated_recv_sf.value();
+                EP_HOST_ASSERT(sf.has_value());
+                EP_HOST_ASSERT(recv_sf_out.is_cuda());
+                EP_HOST_ASSERT(recv_sf_out.scalar_type() == sf->scalar_type());
+                EP_HOST_ASSERT(recv_sf_out.element_size() == sizeof(sf_pack_t));
+                EP_HOST_ASSERT(recv_sf_out.dim() == 2);
+                EP_HOST_ASSERT(recv_sf_out.size(0) == recv_x_out.size(0));
+                EP_HOST_ASSERT(recv_sf_out.size(1) == num_sf_packs);
+            }
             if (preallocated_recv_topk_weights.has_value()) {
                 EP_HOST_ASSERT(topk_weights.has_value());
                 const auto& recv_topk_weights_out = preallocated_recv_topk_weights.value();
@@ -1111,15 +1135,21 @@ public:
         float* recv_topk_weights_ptr = nullptr;
         int recv_sf_token_stride = 0, recv_sf_hidden_stride = 0;
         if (sf.has_value()) {
-            if (not use_tma_aligned_col_major_sf) {
-                recv_sf_token_stride = num_sf_packs, recv_sf_hidden_stride = 1;
+            if (preallocated_recv_sf.has_value()) {
+                recv_sf = preallocated_recv_sf.value();
+                recv_sf_token_stride = recv_sf->stride(0);
+                recv_sf_hidden_stride = recv_sf->stride(1);
             } else {
-                // TMA-aligned layout for the next GEMM input
-                recv_sf_token_stride = 1, recv_sf_hidden_stride = math::align(num_allocated_tokens, kNumAlignedSFPacks);
+                if (not use_tma_aligned_col_major_sf) {
+                    recv_sf_token_stride = num_sf_packs, recv_sf_hidden_stride = 1;
+                } else {
+                    // TMA-aligned layout for the next GEMM input
+                    recv_sf_token_stride = 1, recv_sf_hidden_stride = math::align(num_allocated_tokens, kNumAlignedSFPacks);
+                }
+                recv_sf = torch::empty_strided({num_allocated_tokens, num_sf_packs},
+                                               {recv_sf_token_stride, recv_sf_hidden_stride},
+                                               sf->options());
             }
-            recv_sf = torch::empty_strided({num_allocated_tokens, num_sf_packs},
-                                           {recv_sf_token_stride, recv_sf_hidden_stride},
-                                           sf->options());
             recv_sf_ptr = recv_sf->data_ptr();
         }
         if (not do_expand) {
@@ -1243,7 +1273,7 @@ public:
                              async_with_compute_stream, allocate_on_comm_stream,
                              do_handle_copy, do_cpu_sync, do_expand,
                              use_tma_aligned_col_major_sf,
-                             std::nullopt, std::nullopt, 0);
+                             std::nullopt, std::nullopt, std::nullopt, 0);
     }
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>,
@@ -1259,6 +1289,7 @@ public:
                            const torch::Tensor& topk_weights,
                            const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
                            const torch::Tensor& recv_x_out,
+                           const std::optional<torch::Tensor>& recv_sf_out,
                            const torch::Tensor& recv_topk_weights_out,
                            const int& expanded_row_offset,
                            const int& num_max_tokens_per_rank,
@@ -1285,6 +1316,7 @@ public:
                              do_handle_copy, do_cpu_sync, true,
                              use_tma_aligned_col_major_sf,
                              std::optional<torch::Tensor>(recv_x_out),
+                             recv_sf_out,
                              std::optional<torch::Tensor>(recv_topk_weights_out),
                              expanded_row_offset);
     }
@@ -1336,6 +1368,7 @@ public:
                              false, do_cpu_sync, true,
                              use_tma_aligned_col_major_sf,
                              std::optional<torch::Tensor>(recv_x_out),
+                             std::nullopt,
                              std::nullopt,
                              0);
     }

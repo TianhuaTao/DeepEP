@@ -855,7 +855,7 @@ class ElasticBuffer:
         return recv_x, recv_topk_idx, recv_topk_weights, handle, EventOverlap(event)
 
     def dispatch_expanded_into(self,
-                               x: torch.Tensor,
+                               x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                                topk_idx: torch.Tensor,
                                topk_weights: torch.Tensor,
                                recv_x_out: torch.Tensor,
@@ -871,24 +871,40 @@ class ElasticBuffer:
                                allocate_on_comm_stream: bool = False,
                                do_handle_copy: bool = True,
                                do_cpu_sync: Optional[bool] = None,
-                               expanded_row_offset: int = 0) \
-            -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, EPHandle, EventOverlap]:
+                               expanded_row_offset: int = 0,
+                               recv_sf_out: Optional[torch.Tensor] = None) \
+            -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+                     Optional[torch.Tensor], torch.Tensor, EPHandle, EventOverlap]:
         """
         Dispatch tokens in expanded mode into caller-owned output buffers.
 
-        This is an opt-in wave-overlap variant of `dispatch(..., do_expand=True)`: the copy epilogue writes
+        This caller-owned-output variant of `dispatch(..., do_expand=True)` writes
         received token rows and expanded top-k weights at `expanded_row_offset + local_expanded_row`, while
         the returned handle keeps the usual metadata needed by `combine`.
 
-        The initial implementation supports BF16 tensor inputs and uncached dispatch.
+        Supports BF16 tensor inputs and FP8 ``(data, scale_factors)`` inputs. FP8
+        callers must provide ``recv_sf_out`` alongside ``recv_x_out``; both are
+        caller-owned static-capacity expanded output buffers.
+
+        When ``do_cpu_sync=False``, the caller must size these outputs for the
+        maximum possible expanded row count; no host-side overflow check is
+        performed before the asynchronous device writes.
         """
         check_torch_deterministic()
-        assert not isinstance(x, tuple), 'dispatch_expanded_into currently supports BF16 tensor inputs only'
         assert topk_idx is not None
         assert topk_weights is not None
         assert recv_x_out is not None
         assert recv_topk_weights_out is not None
         assert num_experts is not None
+
+        # Unpack FP8 data and its opaque 4-byte scale packs. The C++ path copies
+        # scale packs without interpreting whether they contain FP32 or UE8M0x4.
+        x, sf = x if isinstance(x, tuple) else (x, None)
+        if sf is None:
+            assert recv_sf_out is None, 'recv_sf_out is only valid for FP8 dispatch'
+        else:
+            assert recv_sf_out is not None, \
+                'FP8 dispatch_expanded_into requires caller-owned recv_sf_out'
 
         num_topk = topk_idx.shape[1]
         num_sms = self.get_theoretical_num_sms(num_experts, num_topk) if num_sms == 0 else num_sms
@@ -909,9 +925,9 @@ class ElasticBuffer:
          dst_buffer_slot_idx,
          token_metadata_at_forward,
          channel_linked_list,
-         event) = self.runtime.dispatch_expanded_into(x, None, topk_idx, topk_weights,
+         event) = self.runtime.dispatch_expanded_into(x, sf, topk_idx, topk_weights,
                                                       cumulative_local_expert_recv_stats,
-                                                      recv_x_out, recv_topk_weights_out,
+                                                      recv_x_out, recv_sf_out, recv_topk_weights_out,
                                                       int(expanded_row_offset),
                                                       num_max_tokens_per_rank,
                                                       num_experts, expert_alignment,
@@ -921,7 +937,7 @@ class ElasticBuffer:
                                                       async_with_compute_stream, allocate_on_comm_stream,
                                                       do_handle_copy, do_cpu_sync,
                                                       False)
-        assert recv_sf is None
+        recv_x = (recv_x, recv_sf) if recv_sf is not None else recv_x
         handle = EPHandle(True,
                           num_experts, expert_alignment,
                           num_max_tokens_per_rank,
